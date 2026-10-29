@@ -1063,6 +1063,29 @@ async def process_promo(message: Message, state: FSMContext):
     await send_main_menu(message, message.from_user.id)
 
 
+# ---------- Диагностика ----------
+
+BOT_VERSION = "2026-10-29 rollypay"
+
+
+def status_text() -> str:
+    return (
+        f"🔧 Версия кода: <code>{BOT_VERSION}</code>\n"
+        f"RollyPay ключ: {'✅ задан' if ROLLYPAY_API_KEY else '❌ НЕ задан'}\n"
+        f"ЮKassa токен: {'✅ задан' if PAYMENTS_PROVIDER_TOKEN else '❌ не задан'}\n"
+        f"ADMIN_ID: <code>{ADMIN_ID}</code>"
+    )
+
+
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    # Команда для проверки настроек. Админу показываем, остальным — ничего.
+    if is_admin(message.from_user.id):
+        await message.answer(status_text())
+    else:
+        await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
+
+
 # ---------- Админка ----------
 
 @router.message(Command("admin"))
@@ -1231,7 +1254,7 @@ async def main():
     notifier = asyncio.create_task(expiry_notifier(bot))
     rolly_task = asyncio.create_task(rolly_poller(bot)) if ROLLYPAY_API_KEY else None
     me = await bot.get_me()
-    logging.info("Бот @%s запущен", me.username)
+    logging.info("Бот @%s запущен. Версия %s. RollyPay: %s", me.username, BOT_VERSION, "ключ задан" if ROLLYPAY_API_KEY else "КЛЮЧ НЕ ЗАДАН")
     try:
         await dp.start_polling(bot)
     finally:
