@@ -655,9 +655,13 @@ def main_menu_text(user: dict) -> str:
     else:
         status = "❌ Подписка не активна"
     return (
-        "🔐 <b>Добро пожаловать в VPN!</b>\n\n"
-        f"📍 Локации: {LOCATIONS_TEXT}\n"
-        f"📱 Устройств в подписке: до {MAX_DEVICES}\n\n"
+        "🔐 <b>Добро пожаловать в ShamerkVPN!</b>\n\n"
+        "Быстрый и стабильный VPN без лишних сложностей: "
+        "подключение за пару минут, одна подписка для всех ваших устройств.\n\n"
+        "⚡ Высокая скорость\n"
+        f"📱 До {MAX_DEVICES} устройств в одной подписке\n"
+        "🎁 Бесплатный пробный период для новых пользователей\n"
+        "🛟 Поддержка всегда на связи\n\n"
         f"Статус: {status}\n\n"
         + legal_footer()
     )
@@ -1065,7 +1069,7 @@ async def process_promo(message: Message, state: FSMContext):
 
 # ---------- Диагностика ----------
 
-BOT_VERSION = "2026-10-29 rollypay"
+BOT_VERSION = "2026-10-29 rollypay v3"
 
 
 def status_text() -> str:
