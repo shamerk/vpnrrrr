@@ -57,6 +57,11 @@ if not BOT_TOKEN or BOT_TOKEN.startswith("сюда_"):
 
 # Платежная система (ЮKassa через @BotFather -> Payments)
 PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN") or ""  # <-- токен ЮKassa от BotFather
+
+# RollyPay (СБП / карта / крипта). API-ключ берётся в личном кабинете rollypay.io
+ROLLYPAY_API_KEY = os.getenv("ROLLYPAY_API_KEY") or ""  # <-- можно вписать ключ сюда
+RP_METHODS = {"sbp": "🏦 СБП", "card": "💳 Банковская карта", "usdt": "🪙 Криптовалюта (USDT)"}
+RP_PAYMENT_TTL = 24 * 3600  # сколько часов ждём оплату по созданному счёту
 CURRENCY = "RUB"
 # Настройки VPN и подписок
 VPN_SUB_BASE_URL = "https://sub.yourdomain.ru/sub/"  # Базовый URL вашей панели (Remnawave / 3x-ui)
@@ -161,7 +166,58 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rolly_payments (
+                payment_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                tariff_id TEXT NOT NULL,
+                amount_rub REAL NOT NULL,
+                method TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
         conn.commit()
+
+
+# ---------- Платежи RollyPay ----------
+
+def create_rolly_payment(payment_id: str, user_id: int, tariff_id: str, amount: float, method: str):
+    with closing(get_conn()) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO rolly_payments (payment_id, user_id, tariff_id, amount_rub, method, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (payment_id, user_id, tariff_id, amount, method, int(time.time())),
+        )
+        conn.commit()
+
+
+def get_rolly_payment(payment_id: str) -> dict | None:
+    with closing(get_conn()) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM rolly_payments WHERE payment_id = ?", (payment_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_pending_rolly_payments() -> list[dict]:
+    with closing(get_conn()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM rolly_payments WHERE status = 'pending'").fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_rolly_status(payment_id: str, new_status: str) -> bool:
+    """Меняет статус только у ещё не закрытого платежа. True — если именно этот вызов его закрыл
+    (защита от двойного начисления дней)."""
+    with closing(get_conn()) as conn:
+        cur = conn.execute(
+            "UPDATE rolly_payments SET status = ? WHERE payment_id = ? AND status = 'pending'",
+            (new_status, payment_id),
+        )
+        conn.commit()
+        return cur.rowcount == 1
 
 
 # ---------- Пользователи и подписки ----------
@@ -458,10 +514,23 @@ def tariffs_kb() -> InlineKeyboardMarkup:
 
 def payment_methods_kb(tariff_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Картой РФ / СБП (ЮKassa)", callback_data=f"pay_card:{tariff_id}")
+    if ROLLYPAY_API_KEY:
+        for method, label in RP_METHODS.items():
+            builder.button(text=label, callback_data=f"pay_rp:{tariff_id}:{method}")
+    if PAYMENTS_PROVIDER_TOKEN:
+        builder.button(text="💳 Картой РФ / СБП (ЮKassa)", callback_data=f"pay_card:{tariff_id}")
     builder.button(text="📜 Пользовательское соглашение", url=TERMS_URL)
     builder.button(text="🔒 Политика конфиденциальности", url=PRIVACY_URL)
     builder.button(text="◀ Назад к тарифам", callback_data="tariffs")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def rolly_pay_kb(pay_url: str, payment_id: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💰 Перейти к оплате", url=pay_url)
+    builder.button(text="✅ Я оплатил — проверить", callback_data=f"chk_rp:{payment_id}")
+    builder.button(text="◀ В главное меню", callback_data="main_menu")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -781,6 +850,149 @@ async def successful_payment(message: Message, bot: Bot):
         )
 
 
+# ---------- Оплата через RollyPay (без домена: статус проверяем сами) ----------
+
+_rolly_client = None
+
+
+def get_rolly_client():
+    """Клиент создаётся при первом обращении, чтобы бот работал и без пакета rollypay."""
+    global _rolly_client
+    if _rolly_client is None and ROLLYPAY_API_KEY:
+        from rollypay import RollyPayClient
+        _rolly_client = RollyPayClient(api_key=ROLLYPAY_API_KEY)
+    return _rolly_client
+
+
+RP_FAILED_STATUSES = {"failed", "cancelled", "canceled", "expired", "rejected", "declined"}
+
+
+async def check_rolly_payment(bot: Bot, p: dict) -> str:
+    """Спрашивает у RollyPay статус платежа и при оплате начисляет подписку.
+    Возвращает: 'paid' | 'pending' | 'failed'."""
+    client = get_rolly_client()
+    data = await asyncio.to_thread(client.payments.get, p["payment_id"])
+    status = str(data.get("status", "")).lower()
+
+    if status == "succeeded":
+        if not set_rolly_status(p["payment_id"], "paid"):
+            return "paid"  # уже начислено ранее
+        title, days, _ = TARIFFS[p["tariff_id"]]
+        ref_id = record_order_and_reward_referrer(
+            p["user_id"], p["tariff_id"], days, p["amount_rub"], f"rollypay_{p['method']}", REF_BONUS_BUY_DAYS
+        )
+        user = get_user(p["user_id"])
+        try:
+            await bot.send_message(
+                p["user_id"],
+                f"✅ <b>Оплата прошла успешно!</b>\n\nТариф: {title}\n"
+                f"Подписка активна до <b>{fmt_date(user['sub_end'])}</b>",
+                reply_markup=my_vpn_kb(sub_url(user)),
+            )
+        except Exception as e:
+            log.warning("Не удалось уведомить об оплате %s: %s", p["user_id"], e)
+        if ref_id:
+            await safe_send(bot, ref_id, f"💸 Ваш друг оформил подписку! Вам начислено +{REF_BONUS_BUY_DAYS} дн.")
+        if ADMIN_ID:
+            await safe_send(
+                bot, ADMIN_ID,
+                f"💰 Новая оплата (RollyPay, {p['method']}): {p['amount_rub']:.0f} ₽, тариф {title}, "
+                f"user_id <code>{p['user_id']}</code>",
+            )
+        return "paid"
+
+    if status in RP_FAILED_STATUSES:
+        set_rolly_status(p["payment_id"], "failed")
+        return "failed"
+    return "pending"
+
+
+@router.callback_query(F.data.startswith("pay_rp:"))
+async def cb_pay_rollypay(call: CallbackQuery, bot: Bot):
+    try:
+        _, tariff_id, method = call.data.split(":")
+    except ValueError:
+        return await call.answer()
+    client = get_rolly_client()
+    if not client or tariff_id not in TARIFFS or method not in RP_METHODS:
+        return await call.answer("Этот способ оплаты сейчас недоступен.", show_alert=True)
+
+    title, days, price = TARIFFS[tariff_id]
+    me = await bot.get_me()
+    order_id = f"{call.from_user.id}-{tariff_id}-{int(time.time())}"
+    try:
+        payment = await asyncio.to_thread(
+            client.payments.create,
+            amount=f"{price:.2f}",
+            order_id=order_id,
+            payment_method=method,
+            description=f"VPN — {title}",
+            customer_id=str(call.from_user.id),
+            redirect_url=f"https://t.me/{me.username}",
+        )
+        payment_id, pay_url = payment["payment_id"], payment["pay_url"]
+    except Exception:
+        log.exception("RollyPay: не удалось создать платёж")
+        return await call.answer("Не удалось создать платёж. Попробуйте позже или другим способом.", show_alert=True)
+
+    create_rolly_payment(payment_id, call.from_user.id, tariff_id, price, method)
+    await call.message.answer(
+        f"🧾 <b>Счёт создан</b>\n\nТариф: {title} ({days} дн.)\nСумма: <b>{price} ₽</b>\n"
+        f"Способ: {RP_METHODS[method]}\n\n"
+        "Нажмите «Перейти к оплате». После оплаты подписка активируется автоматически "
+        "в течение минуты, либо нажмите «Я оплатил — проверить».",
+        reply_markup=rolly_pay_kb(pay_url, payment_id),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("chk_rp:"))
+async def cb_check_rollypay(call: CallbackQuery, bot: Bot):
+    p = get_rolly_payment(call.data.split(":", 1)[1])
+    if not p or p["user_id"] != call.from_user.id:
+        return await call.answer("Платёж не найден.", show_alert=True)
+    if p["status"] == "paid":
+        return await call.answer("Этот платёж уже оплачен и начислен ✅", show_alert=True)
+    if p["status"] == "failed":
+        return await call.answer("Платёж отменён или истёк. Создайте новый.", show_alert=True)
+    try:
+        result = await check_rolly_payment(bot, p)
+    except Exception:
+        log.exception("RollyPay: ошибка проверки платежа")
+        return await call.answer("Не удалось проверить платёж. Попробуйте через минуту.", show_alert=True)
+    if result == "pending":
+        await call.answer("Оплата пока не поступила. Если уже оплатили — подождите минуту.", show_alert=True)
+    elif result == "failed":
+        await call.answer("Платёж отменён или истёк. Создайте новый.", show_alert=True)
+    else:
+        await call.answer("Оплата получена ✅")
+
+
+async def rolly_poller(bot: Bot):
+    """Фоновая проверка неоплаченных счетов — вместо вебхука, поэтому домен не нужен."""
+    tick = 0
+    while True:
+        tick += 1
+        try:
+            now = int(time.time())
+            for p in get_pending_rolly_payments():
+                age = now - p["created_at"]
+                if age > RP_PAYMENT_TTL:
+                    set_rolly_status(p["payment_id"], "failed")
+                    continue
+                # свежие счета проверяем каждые 20 сек, старше 30 минут — раз в 5 минут
+                if age > 1800 and tick % 15 != 0:
+                    continue
+                try:
+                    await check_rolly_payment(bot, p)
+                except Exception:
+                    log.exception("RollyPay: ошибка проверки %s", p["payment_id"])
+                await asyncio.sleep(0.5)
+        except Exception:
+            log.exception("Ошибка в проверке платежей RollyPay")
+        await asyncio.sleep(20)
+
+
 # ---------- Инструкции ----------
 
 @router.callback_query(F.data == "guides")
@@ -1017,12 +1229,15 @@ async def main():
     )
 
     notifier = asyncio.create_task(expiry_notifier(bot))
+    rolly_task = asyncio.create_task(rolly_poller(bot)) if ROLLYPAY_API_KEY else None
     me = await bot.get_me()
     logging.info("Бот @%s запущен", me.username)
     try:
         await dp.start_polling(bot)
     finally:
         notifier.cancel()
+        if rolly_task:
+            rolly_task.cancel()
         await bot.session.close()
 
 
